@@ -1,0 +1,565 @@
+name: ado2gh-migration
+
+# GitHub Actions equivalent of the Azure DevOps pipeline (ado2gh-migration.yml).
+# Six-stage Azure DevOps -> GitHub migration: prerequisite validation, readiness
+# check, repo migration (behind an approval gate), post-migration validation,
+# pipeline rewiring, and Azure Boards integration.
+#
+# Required secrets (Settings -> Secrets and variables -> Actions):
+#   GH_PAT          GitHub PAT with migration scopes        (Stages 1-5)
+#   ADO_PAT         Azure DevOps PAT                         (all stages)
+#   GH_BOARDS_PAT   GitHub PAT with Boards scopes           (Stage 6 only)
+#                   Falls back to GH_PAT if not configured.
+#
+# The "Approve to START MIGRATION" manual gate is implemented via the
+# `migration-approval` GitHub Environment. Add required reviewers to that
+# environment (Settings -> Environments) to reproduce the ManualValidation step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runDemoRepoMigration:
+        description: 'Repo migration & validation only (skip Stages 5-6)'
+        required: false
+        default: false
+        type: boolean
+      skipBoardsIntegration:
+        description: 'Skip Azure Boards Integration (Stage 6)'
+        required: false
+        default: false
+        type: boolean
+      runner_label:
+        description: 'Runner to execute on (GitHub-hosted or self-hosted).'
+        required: false
+        default: ubuntu-latest
+        type: choice
+        options:
+          - ubuntu-latest
+          - self-hosted
+      migrate_timeout_minutes:
+        description: 'Migration job timeout (minutes). GitHub-hosted max: 360.'
+        required: false
+        default: '120'
+        type: choice
+        options:
+          - '60'
+          - '120'
+          - '360'
+          - '720'
+          - '1440'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  # ------------------------------------------------------------
+  # Stage 1: Prerequisite Validation
+  # ------------------------------------------------------------
+  prerequisite-validation:
+    name: 'Stage 1: Prerequisite Validation'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate repos.csv File
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "PREREQUISITE VALIDATION - REPOS.CSV"
+          echo "=========================================="
+
+          VALIDATION_FAILED=0
+          CSV_FILE="bash/repos.csv"
+
+          if [ ! -f "$CSV_FILE" ]; then
+            echo "::error::repos.csv file not found at $CSV_FILE"
+            VALIDATION_FAILED=1
+          fi
+
+          if [ $VALIDATION_FAILED -eq 0 ]; then
+            echo "✅ repos.csv file exists"
+            if [ ! -s "$CSV_FILE" ]; then
+              echo "::error::repos.csv file is empty"
+              VALIDATION_FAILED=1
+            else
+              echo "✅ repos.csv file is not empty"
+            fi
+          fi
+
+          if [ $VALIDATION_FAILED -eq 0 ]; then
+            HEADER=$(head -n 1 "$CSV_FILE")
+            echo ""
+            echo "CSV Header: $HEADER"
+            echo ""
+            REQUIRED_COLUMNS=("org" "teamproject" "repo" "github_org" "github_repo" "gh_repo_visibility")
+            MISSING_COLUMNS=()
+            for col in "${REQUIRED_COLUMNS[@]}"; do
+              if ! echo "$HEADER" | grep -q "$col"; then
+                MISSING_COLUMNS+=("$col")
+              fi
+            done
+            if [ ${#MISSING_COLUMNS[@]} -gt 0 ]; then
+              echo "::error::Missing required columns in repos.csv: ${MISSING_COLUMNS[*]}"
+              VALIDATION_FAILED=1
+            else
+              echo "✅ All required columns present: ${REQUIRED_COLUMNS[*]}"
+              REPO_COUNT=$(($(wc -l < "$CSV_FILE") - 1))
+              echo ""
+              echo "✅ Found $REPO_COUNT repositories to process"
+            fi
+          fi
+
+          exit $VALIDATION_FAILED
+
+      - name: Validate pipelines.csv File
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "VALIDATING PIPELINES.CSV"
+          echo "=========================================="
+
+          VALIDATION_FAILED=0
+          CSV_FILE="bash/pipelines.csv"
+
+          if [ ! -f "$CSV_FILE" ]; then
+            echo "::error::pipelines.csv file not found at $CSV_FILE"
+            VALIDATION_FAILED=1
+          fi
+
+          if [ $VALIDATION_FAILED -eq 0 ]; then
+            echo "✅ pipelines.csv file exists"
+            if [ ! -s "$CSV_FILE" ]; then
+              echo "::error::pipelines.csv file is empty"
+              VALIDATION_FAILED=1
+            else
+              echo "✅ pipelines.csv file is not empty"
+            fi
+          fi
+
+          if [ $VALIDATION_FAILED -eq 0 ]; then
+            HEADER=$(head -n 1 "$CSV_FILE")
+            echo ""
+            echo "CSV Header: $HEADER"
+            echo ""
+            REQUIRED_COLUMNS=("org" "teamproject" "pipeline" "serviceConnection" "github_org" "github_repo")
+            MISSING_COLUMNS=()
+            for col in "${REQUIRED_COLUMNS[@]}"; do
+              if ! echo "$HEADER" | grep -q "$col"; then
+                MISSING_COLUMNS+=("$col")
+              fi
+            done
+            if [ ${#MISSING_COLUMNS[@]} -gt 0 ]; then
+              echo "::error::Missing required columns in pipelines.csv: ${MISSING_COLUMNS[*]}"
+              VALIDATION_FAILED=1
+            else
+              echo "✅ All required columns present: ${REQUIRED_COLUMNS[*]}"
+              PIPELINE_COUNT=$(($(wc -l < "$CSV_FILE") - 1))
+              echo ""
+              echo "✅ Found $PIPELINE_COUNT pipeline(s) to process"
+            fi
+          fi
+
+          exit $VALIDATION_FAILED
+
+  # ------------------------------------------------------------
+  # Stage 2: PR & Pipeline (Readiness) Check
+  # ------------------------------------------------------------
+  readiness-check:
+    name: 'Stage 2: PR & Pipeline Check'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 60
+    needs: [prerequisite-validation]
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      ADO_PAT: ${{ secrets.ADO_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Prerequisites (jq, GitHub CLI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Installing prerequisites..."
+          type -p curl >/dev/null || (sudo apt-get update && sudo apt-get install -y curl)
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          echo "✅ jq installed: $(jq --version)"
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          echo "✅ GitHub CLI installed:"
+          gh --version
+
+      - name: Fix line endings
+        shell: bash
+        run: sed -i 's/\r$//' bash/1_pr_pipeline_check.sh
+
+      - name: Execute Migration Readiness Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bash/1_pr_pipeline_check.sh
+          bash/1_pr_pipeline_check.sh
+
+  # ------------------------------------------------------------
+  # Stage 3: Repo Migration  (approval gate via environment)
+  # ------------------------------------------------------------
+  migration:
+    name: 'Stage 3: Repo Migration'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: ${{ fromJSON(inputs.migrate_timeout_minutes) }}
+    needs: [readiness-check]
+    environment: migration-approval
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      ADO_PAT: ${{ secrets.ADO_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          type -p curl >/dev/null || (sudo apt-get update && sudo apt-get install -y curl)
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          echo "✅ GitHub CLI installed:"
+          gh --version
+
+      - name: Install gh-ado2gh Extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Validating GH_PAT authentication..."
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::GitHub PAT (GH_PAT) is missing."
+            exit 1
+          fi
+          echo "$GH_PAT" | gh auth login --with-token > /dev/null 2>&1 || true
+          if ! gh api user > /dev/null 2>&1; then
+            echo "::error::GitHub PAT authentication failed. Please provide a valid token."
+            exit 1
+          fi
+          echo "✅ GH_PAT authentication successful"
+
+          echo "Installing gh-ado2gh extension..."
+          gh extension install github/gh-ado2gh > /dev/null 2>&1 || true
+          if gh extension list | grep -qi "gh-ado2gh"; then
+            echo "✅ Extension is installed"
+            gh extension list
+            exit 0
+          fi
+          OUTPUT=$(gh extension install github/gh-ado2gh 2>&1 || true)
+          if echo "$OUTPUT" | grep -qiE "permission denied|not permitted|access denied"; then
+            echo "::error::Agent does not have permission to install extensions."
+            exit 1
+          fi
+          echo "::error::gh-ado2gh installation validation failed."
+          exit 1
+
+      - name: Fix line endings
+        shell: bash
+        run: sed -i 's/\r$//' bash/2_migration.sh
+
+      - name: Execute Migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bash/2_migration.sh
+          bash/2_migration.sh --csv bash/repos.csv
+
+      - name: Upload repos_with_status.csv
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-results
+          path: repos_with_status.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload Migration Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-logs-${{ github.run_id }}
+          path: |
+            *.csv
+            *.txt
+            *.log
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------
+  # Stage 4: Post-Migration Validation
+  # ------------------------------------------------------------
+  post-migration-validation:
+    name: 'Stage 4: Migration Validation'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 60
+    needs: [migration]
+    if: ${{ always() && needs.migration.result == 'success' }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      ADO_PAT: ${{ secrets.ADO_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download repos_with_status.csv
+        uses: actions/download-artifact@v4
+        with:
+          name: migration-results
+          path: .
+
+      - name: Prepare repos_with_status.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "repos_with_status.csv" ]; then
+            echo "✅ repos_with_status.csv loaded ($(wc -l < repos_with_status.csv) lines)"
+          else
+            echo "::error::repos_with_status.csv not found in artifacts"
+            exit 1
+          fi
+
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          type -p curl >/dev/null || (sudo apt-get update && sudo apt-get install -y curl)
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          gh --version
+
+      - name: Fix line endings
+        shell: bash
+        run: sed -i 's/\r$//' bash/3_post_migration_validation.sh
+
+      - name: Execute Post-Migration Validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bash/3_post_migration_validation.sh
+          bash/3_post_migration_validation.sh
+
+      - name: Upload Validation Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-logs-${{ github.run_id }}
+          path: |
+            *.csv
+            *.txt
+            *.log
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------
+  # Stage 5: Pipeline Rewiring
+  # ------------------------------------------------------------
+  pipeline-rewiring:
+    name: 'Stage 5: Pipeline Rewiring'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 60
+    needs: [migration, post-migration-validation]
+    if: ${{ always() && inputs.runDemoRepoMigration == false && needs.migration.result == 'success' }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      ADO_PAT: ${{ secrets.ADO_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download repos_with_status.csv
+        uses: actions/download-artifact@v4
+        with:
+          name: migration-results
+          path: .
+
+      - name: Prepare repos_with_status.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "repos_with_status.csv" ]; then
+            echo "✅ repos_with_status.csv loaded ($(wc -l < repos_with_status.csv) lines)"
+          else
+            echo "::error::repos_with_status.csv not found in artifacts"
+            exit 1
+          fi
+
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          type -p curl >/dev/null || (sudo apt-get update && sudo apt-get install -y curl)
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          gh --version
+
+      - name: Install gh-ado2gh Extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::GitHub PAT (GH_PAT) is missing."
+            exit 1
+          fi
+          echo "$GH_PAT" | gh auth login --with-token > /dev/null 2>&1 || true
+          if ! gh api user > /dev/null 2>&1; then
+            echo "::error::GitHub PAT authentication failed. Please provide a valid token."
+            exit 1
+          fi
+          gh extension install github/gh-ado2gh > /dev/null 2>&1 || true
+          if gh extension list | grep -qi "gh-ado2gh"; then
+            echo "✅ Extension is installed"
+            gh extension list
+          else
+            echo "::error::gh-ado2gh installation validation failed."
+            exit 1
+          fi
+
+      - name: Fix line endings
+        shell: bash
+        run: sed -i 's/\r$//' bash/4_rewire_pipeline.sh
+
+      - name: Execute Pipeline Rewiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bash/4_rewire_pipeline.sh
+          bash/4_rewire_pipeline.sh
+
+      - name: Upload Rewiring Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rewiring-logs-${{ github.run_id }}
+          path: |
+            pipeline-rewiring-*.txt
+            *.log
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------
+  # Stage 6: Azure Boards Integration
+  # ------------------------------------------------------------
+  azure-boards-integration:
+    name: 'Stage 6: Boards Integration'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 60
+    needs: [migration, post-migration-validation, pipeline-rewiring]
+    if: ${{ always() && inputs.runDemoRepoMigration == false && inputs.skipBoardsIntegration == false && needs.migration.result == 'success' }}
+    env:
+      # CRITICAL: Stage 6 uses a SEPARATE GitHub PAT with Boards-only scopes.
+      # Falls back to GH_PAT when GH_BOARDS_PAT is not configured.
+      GH_PAT: ${{ secrets.GH_BOARDS_PAT || secrets.GH_PAT }}
+      GH_TOKEN: ${{ secrets.GH_BOARDS_PAT || secrets.GH_PAT }}
+      ADO_PAT: ${{ secrets.ADO_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download repos_with_status.csv
+        uses: actions/download-artifact@v4
+        with:
+          name: migration-results
+          path: .
+
+      - name: Prepare repos_with_status.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "repos_with_status.csv" ]; then
+            echo "✅ repos_with_status.csv loaded ($(wc -l < repos_with_status.csv) lines)"
+          else
+            echo "::error::repos_with_status.csv not found in artifacts"
+            exit 1
+          fi
+
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          type -p curl >/dev/null || (sudo apt-get update && sudo apt-get install -y curl)
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          gh --version
+
+      - name: Install gh-ado2gh Extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::GitHub PAT (GH_PAT) is missing."
+            exit 1
+          fi
+          echo "$GH_PAT" | gh auth login --with-token > /dev/null 2>&1 || true
+          if ! gh api user > /dev/null 2>&1; then
+            echo "::error::GitHub PAT authentication failed. Please provide a valid token."
+            exit 1
+          fi
+          gh extension install github/gh-ado2gh > /dev/null 2>&1 || true
+          if gh extension list | grep -qi "gh-ado2gh"; then
+            echo "✅ Extension is installed"
+            gh extension list
+          else
+            echo "::error::gh-ado2gh installation validation failed."
+            exit 1
+          fi
+
+      - name: Fix line endings
+        shell: bash
+        run: sed -i 's/\r$//' bash/5_boards_integration.sh
+
+      - name: Execute Azure Boards Integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bash/5_boards_integration.sh
+          bash/5_boards_integration.sh
+
+      - name: Upload Azure Boards Integration Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boards-integration-logs-${{ github.run_id }}
+          path: |
+            azure-boards-integration-*.log
+            *.log
+          retention-days: 30
+          if-no-files-found: warn
